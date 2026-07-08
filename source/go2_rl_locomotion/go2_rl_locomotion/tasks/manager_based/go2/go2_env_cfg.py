@@ -20,6 +20,7 @@ from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils.configclass import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
+import isaaclab.utils.math as math_utils
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 from isaaclab_physx.physics import PhysxCfg
 from isaaclab_physx.sim.spawners.materials import PhysxRigidBodyMaterialCfg
@@ -57,6 +58,33 @@ def reward_height_scan_above_threshold(env, sensor_cfg: SceneEntityCfg, min_heig
     return reward
 
 
+def reward_base_height_above_threshold(env, asset_cfg: SceneEntityCfg, min_height: float = 0.25, max_height: float = 0.34) -> torch.Tensor:
+    """Simple linear reward for the robot base height, without ray-casting.
+
+    Reads the root height directly from the articulation's physics state instead of
+    height-scan ray hits, so it only makes sense on flat/known-height ground (the
+    scene here uses a flat plane at z=0). Much cheaper than the height-scan version
+    since it avoids the per-step raycast against the terrain mesh.
+
+    Args:
+        env: The environment instance.
+        asset_cfg: The robot asset configuration.
+        min_height: Minimum height for reward (default: 0.25m) -> reward = 0.0.
+        max_height: Maximum height for reward (default: 0.34m) -> reward = 1.0.
+
+    Returns:
+        Reward tensor with values between 0.0 and 1.0.
+    """
+    asset = env.scene[asset_cfg.name]
+
+    base_height = asset.data.root_pos_w[:, 2]
+
+    # Simple linear reward: 0.0 at min_height, 1.0 at max_height
+    reward = torch.clamp((base_height - min_height) / (max_height - min_height), 0.0, 1.0)
+
+    return reward
+
+
 def foot_clearance_reward(env, asset_cfg: SceneEntityCfg, target_height: float = 0.1, std: float = 0.25, tanh_mult: float = 1.0) -> torch.Tensor:
     """Reward the swinging feet for clearing a specified height off the ground.
 
@@ -86,6 +114,48 @@ def foot_clearance_reward(env, asset_cfg: SceneEntityCfg, target_height: float =
 
     # Return exponential reward (lower error = higher reward)
     return torch.exp(-torch.sum(reward, dim=1) / std)
+
+
+def foot_spread_reward(env, asset_cfg: SceneEntityCfg, min_spread: float = 0.15) -> torch.Tensor:
+    """Penalize the feet for standing narrower than a minimum lateral stance width.
+
+    Measures the lateral distance between left/right foot pairs (FL/FR, RL/RR) in a
+    yaw-only base frame and only penalizes when a pair is narrower than `min_spread`.
+    This one-sided deadzone (unlike a symmetric hip joint_deviation_l1 penalty pulling
+    toward the exact default pose) doesn't fight commanded lateral/strafing motion,
+    which also needs the hips to swing away from their neutral position.
+
+    Args:
+        env: The environment instance.
+        asset_cfg: The robot asset configuration.
+        min_spread: Minimum lateral distance (in meters) between a foot pair before
+            the penalty kicks in.
+
+    Returns:
+        Penalty tensor (>= 0), larger the narrower a foot pair gets below min_spread.
+    """
+    asset = env.scene[asset_cfg.name]
+
+    # Resolve exact FL/FR/RL/RR foot body indices once and cache on the asset instance,
+    # since find_bodies() does an expensive regex resolution over USD prim paths.
+    foot_ids = getattr(asset, "_foot_spread_id_cache", None)
+    if foot_ids is None:
+        foot_ids, _ = asset.find_bodies(["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True)
+        asset._foot_spread_id_cache = foot_ids
+
+    # Rotate foot positions into a yaw-only frame so spread is measured relative to the
+    # robot's heading, not skewed by its current roll/pitch.
+    heading_quat = math_utils.yaw_quat(asset.data.root_quat_w.torch).unsqueeze(1).expand(-1, 4, -1)
+    rel_pos_w = asset.data.body_pos_w.torch[:, foot_ids, :] - asset.data.root_pos_w.torch.unsqueeze(1)
+    foot_pos_b = math_utils.quat_apply_inverse(heading_quat, rel_pos_w)
+
+    front_spread = torch.abs(foot_pos_b[:, 0, 1] - foot_pos_b[:, 1, 1])  # FL vs FR
+    rear_spread = torch.abs(foot_pos_b[:, 2, 1] - foot_pos_b[:, 3, 1])  # RL vs RR
+
+    front_penalty = torch.clamp(min_spread - front_spread, min=0.0)
+    rear_penalty = torch.clamp(min_spread - rear_spread, min=0.0)
+
+    return front_penalty + rear_penalty
 
 
 def gait_reward(env, sensor_cfg: SceneEntityCfg, std: float = 0.25, max_err: float = 0.1,
@@ -178,17 +248,24 @@ def gait_reward(env, sensor_cfg: SceneEntityCfg, std: float = 0.25, max_err: flo
 
 
 def feet_air_time_reward(env, command_name: str, sensor_cfg: SceneEntityCfg, threshold: float,
-                          command_deadzone: float = 0.0) -> torch.Tensor:
-    """Reward long-enough steps taken by the feet using an L2-kernel.
+                          cap: float | None = None, command_deadzone: float = 0.0) -> torch.Tensor:
+    """Reward long-enough (but not too long) steps taken by the feet using an L2-kernel.
 
-    Same as isaaclab_tasks' mdp.feet_air_time, except the hard >0.1 m/s command gate is
-    replaced with an optional, much smaller deadzone (0.0 by default = no gate), so
-    stepping in place at low/zero commanded velocity still earns reward instead of being
-    zeroed out.
+    Same as isaaclab_tasks' mdp.feet_air_time, except:
+    - The hard >0.1 m/s command gate is replaced with an optional, much smaller deadzone
+      (0.0 by default = no gate), so stepping in place at low/zero commanded velocity
+      still earns reward instead of being zeroed out.
+    - `cap`, if set, clamps the air time used in the reward so swings longer than `cap`
+      earn no extra reward. Without a cap this reward is linear and unbounded in swing
+      duration, meaning the policy is always better off taking *longer* strides no matter
+      how low `threshold` is set. Capping removes that "longer is always better" pull and
+      creates real pressure toward a fast, specific cadence instead.
     """
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     first_contact = contact_sensor.compute_first_contact(env.step_dt).torch[:, sensor_cfg.body_ids]
     last_air_time = contact_sensor.data.last_air_time.torch[:, sensor_cfg.body_ids]
+    if cap is not None:
+        last_air_time = torch.clamp(last_air_time, max=cap)
     reward = torch.sum((last_air_time - threshold) * first_contact, dim=1)
     if command_deadzone > 0.0:
         reward *= torch.linalg.norm(env.command_manager.get_command(command_name)[:, :2], dim=1) > command_deadzone
@@ -197,7 +274,7 @@ def feet_air_time_reward(env, command_name: str, sensor_cfg: SceneEntityCfg, thr
 ##
 # Pre-defined configs
 ##
-from .go2ArticulationCFG import MY_DOG_CFG  # Import your go2 articulation config
+from .go2_articulation_cfg import MY_DOG_CFG  # Import your go2 articulation config
 
 
 ##
@@ -413,47 +490,57 @@ class RewardsCfg:
 
     feet_air_time = RewTerm(
         func=feet_air_time_reward,
-        weight=0.25, #0.125
+        weight=0.3, #0.125
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
             "command_name": "base_velocity",
-            "threshold": 0.3, #0.5
+            "threshold": 0.25, #0.5
+            "cap": 0.35,  # no extra reward for swings longer than this -> pushes toward a fast, capped cadence
             "command_deadzone": 0.0,  # no gate: reward stepping even at zero commanded velocity
         },
     )
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-0.1,
+        weight=-0.4,
         params={
-
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_thigh"),
             "threshold": 1.0
         },
     )
 
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight= -2.5) #0
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight= -0.2) #0
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
 
-    # Height-based reward - simple linear reward system
+    # Height-based reward - simple linear reward system (uses root state, no height-scan raycast)
     height_scan_threshold = RewTerm(
-        func=reward_height_scan_above_threshold,
-        weight=0.45,  
+        func=reward_base_height_above_threshold,
+        weight=0.3,
         params={
-            "sensor_cfg": SceneEntityCfg("height_scanner"),
-            "min_height": 0.20,  # 0.0 reward at 23cm
-            "max_height": 0.23   # 1.0 reward at 26cm
+            "asset_cfg": SceneEntityCfg("robot"),
+            "min_height": 0.25,  # 0.0 reward at 23cm
+            "max_height": 0.34   # 1.0 reward at 26cm
         },
     )
 
     # Foot clearance reward - encourage lifting feet during swing phase
     foot_clearance = RewTerm(
         func=foot_clearance_reward,
-        weight=0.3, 
+        weight=0.3,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-            "target_height": 0.12,  # Target 10cm foot clearance
+            "target_height": 0.13,  # Target 10cm foot clearance
             "std": 0.05,             # Standard deviation for reward shaping
             "tanh_mult": 1.0        # Velocity sensitivity multiplier
+        },
+    )
+
+    # Foot spread penalty - discourage feet from narrowing in past a minimum stance width
+    foot_spread = RewTerm(
+        func=foot_spread_reward,
+        weight=-0.5,  # tune against logged foot spread; only fires when narrower than min_spread
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "min_spread": 0.2,  # meters, starting guess for FL/FR and RL/RR lateral distance
         },
     )
 
@@ -526,10 +613,10 @@ class Go2EnvCfg(ManagerBasedRLEnvCfg):
         # PhysX settings optimized for your setup
         self.sim.physics = PhysxCfg(
             solver_type=1,  # TGS solver for better performance
-            gpu_max_rigid_patch_count=5 * 2**16,  
-            gpu_max_rigid_contact_count=2**24,  
-            gpu_found_lost_pairs_capacity=2**22,  
-            gpu_found_lost_aggregate_pairs_capacity=2**26,  
+            gpu_max_rigid_patch_count=5 * 2**17,
+            gpu_max_rigid_contact_count=2**24,
+            gpu_found_lost_pairs_capacity=2**22,
+            gpu_found_lost_aggregate_pairs_capacity=2**26,
             gpu_total_aggregate_pairs_capacity=2**22,
             friction_offset_threshold=0.04,
             friction_correlation_distance=0.025,

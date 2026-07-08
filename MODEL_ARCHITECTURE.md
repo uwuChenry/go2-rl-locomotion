@@ -195,7 +195,7 @@ base_contact: TERMINATION     # End episode on base contact
 
 ### Configuration Files
 - Main Config: `source/go2_rl_locomotion/go2_rl_locomotion/tasks/manager_based/go2/go2_env_cfg.py`
-- Robot Model: `source/go2_rl_locomotion/go2_rl_locomotion/tasks/manager_based/go2/go2ArticulationCFG.py`
+- Robot Model: `source/go2_rl_locomotion/go2_rl_locomotion/tasks/manager_based/go2/go2_articulation_cfg.py`
 - Training Config: `source/go2_rl_locomotion/go2_rl_locomotion/tasks/manager_based/go2/agents/rsl_rl_ppo_cfg.py`
 
 ## Future Enhancements
