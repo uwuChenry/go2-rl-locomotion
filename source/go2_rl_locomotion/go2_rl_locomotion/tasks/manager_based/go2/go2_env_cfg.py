@@ -12,6 +12,7 @@ from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import ManagerTermBase
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
@@ -22,6 +23,7 @@ from isaaclab.utils.configclass import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 import isaaclab.utils.math as math_utils
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
+from isaaclab.utils.noise import NoiseModelWithAdditiveBiasCfg
 from isaaclab_physx.physics import PhysxCfg
 from isaaclab_physx.sim.spawners.materials import PhysxRigidBodyMaterialCfg
 
@@ -85,6 +87,37 @@ def reward_base_height_above_threshold(env, asset_cfg: SceneEntityCfg, min_heigh
     return reward
 
 
+# def foot_clearance_reward(env, asset_cfg: SceneEntityCfg, target_height: float = 0.1, min_velocity: float = 0.1) -> torch.Tensor:
+#     """Reward feet that are simultaneously moving AND have cleared a minimum height.
+
+#     Unlike a smoothly-shaped exp(-error/std) reward, this is a hard AND gate: a foot
+#     only counts if it's actually swinging (not planted/dragging) AND its height is at
+#     or above `target_height`. There's no partial credit for a foot that's fast but low
+#     (e.g. dragging along the ground) or one that's high but not moving -- both earn zero.
+
+#     Args:
+#         env: The environment instance.
+#         asset_cfg: The asset configuration for the robot.
+#         target_height: Minimum foot height (in meters) to count as "cleared".
+#         min_velocity: Minimum foot speed (in m/s, full 3D velocity) to count as
+#             "moving" -- filters out stance-phase jitter so planted feet can't pass the gate.
+
+#     Returns:
+#         Reward tensor: count of feet simultaneously moving and cleared (0 to len(body_ids)).
+#     """
+#     # Get the robot asset
+#     asset = env.scene[asset_cfg.name]
+
+#     foot_height = asset.data.body_pos_w.torch[:, asset_cfg.body_ids, 2]
+#     # Full 3D velocity, not just horizontal XY, so pure vertical stepping-in-place still
+#     # counts as "moving" instead of being scored as planted.
+#     foot_speed = torch.norm(asset.data.body_lin_vel_w.torch[:, asset_cfg.body_ids, :], dim=2)
+
+#     is_moving = foot_speed > min_velocity
+#     is_cleared = foot_height > target_height
+
+#     return torch.sum((is_moving & is_cleared).float(), dim=1)
+
 def foot_clearance_reward(env, asset_cfg: SceneEntityCfg, target_height: float = 0.1, std: float = 0.25, tanh_mult: float = 1.0) -> torch.Tensor:
     """Reward the swinging feet for clearing a specified height off the ground.
 
@@ -115,8 +148,7 @@ def foot_clearance_reward(env, asset_cfg: SceneEntityCfg, target_height: float =
     # Return exponential reward (lower error = higher reward)
     return torch.exp(-torch.sum(reward, dim=1) / std)
 
-
-def foot_spread_reward(env, asset_cfg: SceneEntityCfg, min_spread: float = 0.15) -> torch.Tensor:
+def foot_spread_reward(env, asset_cfg: SceneEntityCfg, min_spread: float = 0.2) -> torch.Tensor:
     """Penalize the feet for standing narrower than a minimum lateral stance width.
 
     Measures the lateral distance between left/right foot pairs (FL/FR, RL/RR) in a
@@ -156,6 +188,92 @@ def foot_spread_reward(env, asset_cfg: SceneEntityCfg, min_spread: float = 0.15)
     rear_penalty = torch.clamp(min_spread - rear_spread, min=0.0)
 
     return front_penalty + rear_penalty
+
+
+class FootStepQualityReward(ManagerTermBase):
+    """Reward a foot once per landing if it was both well-timed AND cleared a minimum height.
+
+    Replaces two separate terms (feet_air_time's timing reward and foot_clearance's
+    per-step height gate) with a single event-triggered "good step" signal, paid out only
+    at the instant a foot lands. This closes the double-dipping loophole where a policy
+    could earn extra reward just by hovering a foot above the height bar for many steps
+    (foot_clearance was summed every step) independent of how long it stayed airborne
+    (feet_air_time plateaued past its cap but never penalized excessive hang time).
+
+    Timing quality is a tent function of the completed swing's air time: 0 below
+    `threshold`, ramping up to a peak of 1 at `cap`, then ramping back down to 0 at
+    `hard_cap` (previously it just plateaued at `cap` with no ceiling). Height clearance
+    is scored from the *peak* height reached during that specific swing (tracked in a
+    persistent per-foot buffer, reset at liftoff and read out at landing) rather than the
+    foot's height at any single instant, since height at the landing step itself is ~0.
+    Clearance is a quadratic ramp (0 at zero height -> 1.0 at target_height, flat above),
+    not a hard 0/1 cutoff -- easier to learn from early on since a foot that's getting
+    close but hasn't fully cleared still earns partial credit instead of nothing.
+
+    Args (passed as reward term params, forwarded to __call__ each step):
+        sensor_cfg: The contact sensor configuration (used for air-time bookkeeping).
+        asset_cfg: The robot asset configuration (used for foot world position).
+        target_height: Minimum peak height (in meters) a swing must reach to count as cleared.
+        threshold: Air time (in seconds) below which a landing earns zero timing reward.
+        cap: Air time (in seconds) at which timing reward peaks at 1.0.
+        hard_cap: Air time (in seconds) at which timing reward has decayed back to 0.0.
+    """
+
+    _FOOT_NAMES = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+
+    def __init__(self, cfg: RewTerm, env):
+        super().__init__(cfg, env)
+        self.asset = env.scene[cfg.params["asset_cfg"].name]
+        self.contact_sensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+        # Resolve the same four feet, by exact name, independently on both the asset and
+        # the sensor -- their body-id orderings aren't guaranteed to match each other, so
+        # we can't reuse one SceneEntityCfg's body_ids to index into the other's tensors.
+        self.asset_body_ids, _ = self.asset.find_bodies(self._FOOT_NAMES, preserve_order=True)
+        self.sensor_body_ids, _ = self.contact_sensor.find_bodies(self._FOOT_NAMES, preserve_order=True)
+        self.peak_height = torch.zeros(env.num_envs, len(self._FOOT_NAMES), device=env.device)
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = slice(None)
+        self.peak_height[env_ids] = 0.0
+
+    def __call__(
+        self,
+        env,
+        sensor_cfg: SceneEntityCfg,
+        asset_cfg: SceneEntityCfg,
+        target_height: float = 0.1,
+        threshold: float = 0.4,
+        cap: float = 0.5,
+        hard_cap: float = 0.65,
+    ) -> torch.Tensor:
+        foot_z = self.asset.data.body_pos_w.torch[:, self.asset_body_ids, 2]
+
+        is_first_air = self.contact_sensor.compute_first_air(env.step_dt).torch[:, self.sensor_body_ids].bool()
+        is_first_contact = self.contact_sensor.compute_first_contact(env.step_dt).torch[:, self.sensor_body_ids].bool()
+
+        # Start a fresh peak at liftoff, then track the running max while airborne.
+        self.peak_height = torch.where(is_first_air, torch.zeros_like(self.peak_height), self.peak_height)
+        self.peak_height = torch.maximum(self.peak_height, foot_z)
+
+        # Tent-shaped timing quality: ramps 0 -> 1 across [threshold, cap], then back down
+        # to 0 across [cap, hard_cap], instead of plateauing at 1 forever past cap.
+        last_air_time = self.contact_sensor.data.last_air_time.torch[:, self.sensor_body_ids]
+        ramp_up = torch.clamp((last_air_time - threshold) / (cap - threshold), 0.0, 1.0)
+        ramp_down = torch.clamp((hard_cap - last_air_time) / (hard_cap - cap), 0.0, 1.0)
+        timing_quality = torch.minimum(ramp_up, ramp_down)
+
+        # Quadratic clearance credit instead of a hard 0/1 gate: 0 at zero height, ramping
+        # up to 1.0 as peak_height approaches target_height, flat at 1.0 once it's cleared.
+        # Gives partial credit (and gradient signal) for a foot that's getting close but
+        # hasn't fully cleared yet, instead of all-or-nothing -- easier to bootstrap early
+        # in training than an immediate hard cutoff.
+        clearance_ratio = torch.clamp(self.peak_height / target_height, 0.0, 1.0)
+        clearance_score = clearance_ratio**2
+
+        # Only pays out on the landing step for a foot that just completed a swing that
+        # was both well-timed and had some/full clearance credit.
+        return torch.sum(timing_quality * clearance_score * is_first_contact.float(), dim=1)
 
 
 def gait_reward(env, sensor_cfg: SceneEntityCfg, std: float = 0.25, max_err: float = 0.1,
@@ -248,33 +366,94 @@ def gait_reward(env, sensor_cfg: SceneEntityCfg, std: float = 0.25, max_err: flo
 
 
 def feet_air_time_reward(env, command_name: str, sensor_cfg: SceneEntityCfg, threshold: float,
-                          cap: float | None = None, command_deadzone: float = 0.0) -> torch.Tensor:
-    """Reward long-enough (but not too long) steps taken by the feet using an L2-kernel.
+                          cap_start: float, cap_end: float, hard_cap: float,
+                          command_deadzone: float = 0.0) -> torch.Tensor:
+    """Reward well-timed steps taken by the feet using a trapezoidal quality score.
 
     Same as isaaclab_tasks' mdp.feet_air_time, except:
     - The hard >0.1 m/s command gate is replaced with an optional, much smaller deadzone
       (0.0 by default = no gate), so stepping in place at low/zero commanded velocity
       still earns reward instead of being zeroed out.
-    - `cap`, if set, clamps the air time used in the reward so swings longer than `cap`
-      earn no extra reward. Without a cap this reward is linear and unbounded in swing
-      duration, meaning the policy is always better off taking *longer* strides no matter
-      how low `threshold` is set. Capping removes that "longer is always better" pull and
-      creates real pressure toward a fast, specific cadence instead.
+    - Instead of a linear, unbounded-above `(air_time - threshold)` (which always pulls
+      the policy toward *longer* strides no matter how low `threshold` is set), air time
+      is scored with a trapezoid: 0 below `threshold`, ramping up to 1 across
+      [`threshold`, `cap_start`], flat at 1 across [`cap_start`, `cap_end`], then ramping
+      back down to 0 across [`cap_end`, `hard_cap`]. Both too-short and too-long swings
+      are actively pushed against instead of merely not being extra-rewarded.
     """
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     first_contact = contact_sensor.compute_first_contact(env.step_dt).torch[:, sensor_cfg.body_ids]
     last_air_time = contact_sensor.data.last_air_time.torch[:, sensor_cfg.body_ids]
-    if cap is not None:
-        last_air_time = torch.clamp(last_air_time, max=cap)
-    reward = torch.sum((last_air_time - threshold) * first_contact, dim=1)
+    ramp_up = torch.clamp((last_air_time - threshold) / (cap_start - threshold), 0.0, 1.0)
+    ramp_down = torch.clamp((hard_cap - last_air_time) / (hard_cap - cap_end), 0.0, 1.0)
+    quality = torch.minimum(ramp_up, ramp_down)
+    reward = torch.sum(quality * first_contact, dim=1)
     if command_deadzone > 0.0:
         reward *= torch.linalg.norm(env.command_manager.get_command(command_name)[:, :2], dim=1) > command_deadzone
     return reward
 
+class FootClearanceQualityReward(ManagerTermBase):
+    """Reward a foot once per landing for the peak height it reached during its swing.
+
+    Mirrors feet_air_time_reward's threshold -> cap ramp, but scores swing height instead
+    of duration, and has no hard cap: reward ramps 0 -> 1 across [threshold, cap], then
+    stays at 1.0 for any peak height above cap. A foot that clears extra high is never
+    penalized for it, unlike feet_air_time_reward which does punish swings that run long.
+
+    Peak height is tracked in a persistent per-foot buffer, reset at liftoff and updated
+    with a running max while airborne, then read out and paid at the landing step --
+    scoring the foot's *current* height wouldn't work since it's ~0 right at landing.
+
+    Args (passed as reward term params, forwarded to __call__ each step):
+        asset_cfg: The robot asset configuration (used for foot world position).
+        sensor_cfg: The contact sensor configuration (used for landing detection).
+        threshold: Peak swing height (in meters) below which a landing earns zero reward.
+        cap: Peak swing height (in meters) at which the reward saturates at 1.0.
+    """
+
+    _FOOT_NAMES = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+
+    def __init__(self, cfg: RewTerm, env):
+        super().__init__(cfg, env)
+        self.asset = env.scene[cfg.params["asset_cfg"].name]
+        self.contact_sensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+        # Resolve the same four feet, by exact name, independently on both the asset and
+        # the sensor -- their body-id orderings aren't guaranteed to match each other.
+        self.asset_body_ids, _ = self.asset.find_bodies(self._FOOT_NAMES, preserve_order=True)
+        self.sensor_body_ids, _ = self.contact_sensor.find_bodies(self._FOOT_NAMES, preserve_order=True)
+        self.peak_height = torch.zeros(env.num_envs, len(self._FOOT_NAMES), device=env.device)
+
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = slice(None)
+        self.peak_height[env_ids] = 0.0
+
+    def __call__(
+        self,
+        env,
+        asset_cfg: SceneEntityCfg,
+        sensor_cfg: SceneEntityCfg,
+        threshold: float = 0.03,
+        cap: float = 0.1,
+    ) -> torch.Tensor:
+        foot_z = self.asset.data.body_pos_w.torch[:, self.asset_body_ids, 2]
+
+        is_first_air = self.contact_sensor.compute_first_air(env.step_dt).torch[:, self.sensor_body_ids].bool()
+        is_first_contact = self.contact_sensor.compute_first_contact(env.step_dt).torch[:, self.sensor_body_ids].bool()
+
+        # Start a fresh peak at liftoff, then track the running max while airborne.
+        self.peak_height = torch.where(is_first_air, torch.zeros_like(self.peak_height), self.peak_height)
+        self.peak_height = torch.maximum(self.peak_height, foot_z)
+
+        quality = torch.clamp((self.peak_height - threshold) / (cap - threshold), 0.0, 1.0)
+
+        return torch.sum(quality * is_first_contact.float(), dim=1)
+
+
 ##
 # Pre-defined configs
 ##
-from .go2_articulation_cfg import MY_DOG_CFG  # Import your go2 articulation config
+from .go2_articulation_cfg import MY_DOG_CFG
 
 
 ##
@@ -305,20 +484,22 @@ class Go2SceneCfg(InteractiveSceneCfg):
         ),
         debug_vis=False,
     )
-    # robot - using your custom go2 configuration
+    # robot
     robot: ArticulationCfg = MY_DOG_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-    # Height scanner for terrain awareness
-    height_scanner = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
-        ray_alignment="yaw",
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
-        debug_vis=True,  # Enable ray visualization
-        mesh_prim_paths=["/World/ground"],
-    )
+    # Height scanner for terrain awareness - disabled (unused by any reward/obs term, was
+    # costing a ~187-ray raycast per env every control step; terrain is a flat plane so
+    # reward_base_height_above_threshold reads root height directly instead).
+    # height_scanner = RayCasterCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/base",
+    #     offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+    #     ray_alignment="yaw",
+    #     pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+    #     debug_vis=True,  # Enable ray visualization
+    #     mesh_prim_paths=["/World/ground"],
+    # )
 
-    # Contact sensors - commented out for now
+    # Contact sensors
     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
 
     # lights
@@ -368,19 +549,43 @@ class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
-        projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
+        base_lin_vel = ObsTerm(
+            func=mdp.base_lin_vel,
+            noise=NoiseModelWithAdditiveBiasCfg(
+                noise_cfg=Unoise(n_min=-0.2, n_max=0.2),
+                bias_noise_cfg=Unoise(n_min=-0.15, n_max=0.15),
+            ),
+        )
+        base_ang_vel = ObsTerm(
+            func=mdp.base_ang_vel,
+            noise=NoiseModelWithAdditiveBiasCfg(
+                noise_cfg=Unoise(n_min=-0.3, n_max=0.3),
+                bias_noise_cfg=Unoise(n_min=-0.1, n_max=0.1),
+            ),
+        )
+        projected_gravity = ObsTerm(
+            func=mdp.projected_gravity,
+            noise=NoiseModelWithAdditiveBiasCfg(
+                noise_cfg=Unoise(n_min=-0.08, n_max=0.08),
+                bias_noise_cfg=Unoise(n_min=-0.05, n_max=0.05),
+            ),
+        )
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
+        joint_pos = ObsTerm(
+            func=mdp.joint_pos_rel,
+            noise=NoiseModelWithAdditiveBiasCfg(
+                noise_cfg=Unoise(n_min=-0.02, n_max=0.02),
+                bias_noise_cfg=Unoise(n_min=-0.01, n_max=0.01),
+            ),
+        )
+        joint_vel = ObsTerm(
+            func=mdp.joint_vel_rel,
+            noise=NoiseModelWithAdditiveBiasCfg(
+                noise_cfg=Unoise(n_min=-2.5, n_max=2.5),
+                bias_noise_cfg=Unoise(n_min=-0.5, n_max=0.5),
+            ),
+        )
         actions = ObsTerm(func=mdp.last_action)
-        # height_scan = ObsTerm(
-        #     func=mdp.height_scan,
-        #     params={"sensor_cfg": SceneEntityCfg("height_scanner")},
-        #     noise=Unoise(n_min=-0.1, n_max=0.1),
-        #     clip=(-1.0, 1.0),
-        # )
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -400,8 +605,8 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.8, 0.8),
-            "dynamic_friction_range": (0.6, 0.6),
+            "static_friction_range": (0.7, 0.9), # 0.8 .0.8
+            "dynamic_friction_range": (0.5, 0.7), #0.6 0.6
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
@@ -412,7 +617,7 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-            "mass_distribution_params": (-1.0, 3.0),
+            "mass_distribution_params": (-2.0, 5.0),
             "operation": "add",
         },
     )
@@ -422,7 +627,7 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-            "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.01, 0.01)},
+            "com_range": {"x": (-0.1, 0.1), "y": (-0.1, 0.1), "z": (-0.05, 0.05)},
         },
     )
 
@@ -484,51 +689,89 @@ class RewardsCfg:
     # -- penalties
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-    dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.00002)
-    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
+    dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.00001)
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-8)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
 
     feet_air_time = RewTerm(
         func=feet_air_time_reward,
-        weight=0.3, #0.125
+        weight=0.8, #0.125
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
             "command_name": "base_velocity",
-            "threshold": 0.25, #0.5
-            "cap": 0.35,  # no extra reward for swings longer than this -> pushes toward a fast, capped cadence
+            "threshold": 0.1,   # 0 reward below this
+            "cap_start": 0.2,   # ramps 0 -> 1 across [threshold, cap_start]
+            "cap_end": 0.21,     # flat at 1 across [cap_start, cap_end]
+            "hard_cap": 0.31,    # ramps 1 -> 0 across [cap_end, hard_cap]
             "command_deadzone": 0.0,  # no gate: reward stepping even at zero commanded velocity
         },
     )
+
+    # Foot clearance quality - on top of feet_air_time and foot_clearance above. Pays out
+    # once per landing based on the peak height that swing reached: 0 below threshold,
+    # ramps to full reward at cap, then stays at full reward past cap (no hard cap/decay
+    # for height, unlike feet_air_time's trapezoid -- a foot is never punished for
+    # clearing extra high).
+    foot_clearance_quality = RewTerm(
+        func=FootClearanceQualityReward,
+        weight=0.4,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "threshold": 0.05,  # 0 reward for swings peaking below 3cm
+            "cap": 0.1,         # full reward for swings peaking at/above 10cm
+        },
+    )
+
+    # # Combined step-quality reward - supersedes feet_air_time + foot_clearance above.
+    # # Pays out once per landing, only for a foot whose completed swing was both well-timed
+    # # (tent-shaped: ramps up to threshold->cap, back down to 0 by hard_cap) AND actually
+    # # cleared target_height at its peak -- avoids double-counting/hovering exploits from
+    # # having those as two separate, per-step-accumulating terms.
+    # foot_step_quality = RewTerm(
+    #     func=FootStepQualityReward,
+    #     weight=0.8,
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+    #         "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+    #         "target_height": 0.07,
+    #         "threshold": 0.4,
+    #         "cap": 0.5,
+    #         "hard_cap": 0.7,
+    #     },
+    # )
+
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-0.4,
+        weight=-0.5,
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_thigh"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*_thigh", ".*_calf"]),
             "threshold": 1.0
         },
     )
 
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight= -0.2) #0
-    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight= -2.5) #0
+    # dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
 
-    # Height-based reward - simple linear reward system (uses root state, no height-scan raycast)
+    # Height-based reward 
     height_scan_threshold = RewTerm(
         func=reward_base_height_above_threshold,
-        weight=0.3,
+        weight=0.2,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "min_height": 0.25,  # 0.0 reward at 23cm
-            "max_height": 0.34   # 1.0 reward at 26cm
+            "min_height": 0.2,  # 0.0 reward at 23cm
+            "max_height": 0.33   # 1.0 reward at 26cm
         },
     )
 
-    # Foot clearance reward - encourage lifting feet during swing phase
+    # Foot clearance reward - superseded by foot_step_quality above (combined with air-time
+    # timing into one landing-triggered term instead of a per-step-accumulating gate).
     foot_clearance = RewTerm(
         func=foot_clearance_reward,
-        weight=0.3,
+        weight=0.3, 
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-            "target_height": 0.13,  # Target 10cm foot clearance
+            "target_height": 0.1,  # Target 10cm foot clearance
             "std": 0.05,             # Standard deviation for reward shaping
             "tanh_mult": 1.0        # Velocity sensitivity multiplier
         },
@@ -537,21 +780,21 @@ class RewardsCfg:
     # Foot spread penalty - discourage feet from narrowing in past a minimum stance width
     foot_spread = RewTerm(
         func=foot_spread_reward,
-        weight=-0.5,  # tune against logged foot spread; only fires when narrower than min_spread
+        weight=-0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "min_spread": 0.2,  # meters, starting guess for FL/FR and RL/RR lateral distance
+            "min_spread": 0.22,  # meters, FL/FR and RL/RR lateral distance
         },
     )
 
-    # Gait reward - enforce proper trotting gait pattern
+    # Gait reward
     gait_pattern = RewTerm(
         func=gait_reward,
-        weight=1.0,  # Adjust this weight as needed
+        weight=1.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces"),
-            "std": 0.1,             # Standard deviation for reward shaping (tighter control)
-            "max_err": 0.2,         # Maximum error clipping
+            "std": 0.1,
+            "max_err": 0.2,
             "synced_feet_pair_names": [
                 ["FL_foot", "RR_foot"],  # Diagonal pair 1: Front-Left with Rear-Right
                 ["FR_foot", "RL_foot"]   # Diagonal pair 2: Front-Right with Rear-Left
@@ -565,7 +808,6 @@ class TerminationsCfg:
     """Termination terms for the MDP."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # Contact-based termination commented out for now
     base_contact = DoneTerm(
         func=mdp.illegal_contact,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
@@ -576,7 +818,6 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    # No terrain curriculum for flat ground
     pass
 
 
@@ -610,7 +851,6 @@ class Go2EnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 0.005  # 200fps
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
-        # PhysX settings optimized for your setup
         self.sim.physics = PhysxCfg(
             solver_type=1,  # TGS solver for better performance
             gpu_max_rigid_patch_count=5 * 2**17,
@@ -624,8 +864,8 @@ class Go2EnvCfg(ManagerBasedRLEnvCfg):
         # update sensor update periods
         if self.scene.contact_forces is not None:
             self.scene.contact_forces.update_period = self.sim.dt
-        if self.scene.height_scanner is not None:
-            self.scene.height_scanner.update_period = self.decimation * self.sim.dt
+        # if self.scene.height_scanner is not None:
+        #     self.scene.height_scanner.update_period = self.decimation * self.sim.dt
 
 
 @configclass
