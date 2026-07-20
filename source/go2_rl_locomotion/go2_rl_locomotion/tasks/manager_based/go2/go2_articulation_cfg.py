@@ -16,6 +16,9 @@ from isaaclab_physx.sim.schemas import PhysxArticulationRootPropertiesCfg, Physx
 
 _ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 GO2_SIMPLIFIED_USD_PATH = os.path.join(_ASSETS_DIR, "go2_simplified", "go2_simplified.usd")
+GO2_BACK_PLATFORM_USD_PATH = os.path.join(
+    _ASSETS_DIR, "go2_back_platform", "go2_back_platform.usd", "go2_back_platform", "go2_back_platform.usda"
+)
 
 MY_DOG_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
@@ -57,4 +60,28 @@ MY_DOG_CFG = ArticulationCfg(
             friction=0.0,
         ),
     },
+)
+
+##
+# Configuration for the Unitree Go2 with the back platform payload
+# (Jetson + rail plate + RPLidar + OAK camera, merged rigidly into the base body)
+##
+
+GO2_BACK_PLATFORM_CFG = MY_DOG_CFG.replace(
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=GO2_BACK_PLATFORM_USD_PATH,
+        activate_contact_sensors=True,
+        rigid_props=PhysxRigidBodyPropertiesCfg(
+            disable_gravity=False,
+            retain_accelerations=False,
+            linear_damping=0.0,
+            angular_damping=0.0,
+            max_linear_velocity=1000.0,
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=1.0,
+        ),
+        articulation_props=PhysxArticulationRootPropertiesCfg(
+            enabled_self_collisions=True, solver_position_iteration_count=4, solver_velocity_iteration_count=0
+        ),
+    ),
 )
