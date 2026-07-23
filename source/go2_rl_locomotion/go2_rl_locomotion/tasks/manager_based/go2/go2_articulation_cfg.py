@@ -19,6 +19,12 @@ GO2_SIMPLIFIED_USD_PATH = os.path.join(_ASSETS_DIR, "go2_simplified", "go2_simpl
 GO2_BACK_PLATFORM_USD_PATH = os.path.join(
     _ASSETS_DIR, "go2_back_platform", "go2_back_platform.usd", "go2_back_platform", "go2_back_platform.usda"
 )
+GO2_SIMPLIFIED_BACK_PLATFORM_USD_PATH = os.path.join(
+    _ASSETS_DIR,
+    "go2_simplified_back_platform",
+    "go2_simplified_back_platform",
+    "go2_simplified_back_platform.usda",
+)
 
 MY_DOG_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
@@ -70,6 +76,30 @@ MY_DOG_CFG = ArticulationCfg(
 GO2_BACK_PLATFORM_CFG = MY_DOG_CFG.replace(
     spawn=sim_utils.UsdFileCfg(
         usd_path=GO2_BACK_PLATFORM_USD_PATH,
+        activate_contact_sensors=True,
+        rigid_props=PhysxRigidBodyPropertiesCfg(
+            disable_gravity=False,
+            retain_accelerations=False,
+            linear_damping=0.0,
+            angular_damping=0.0,
+            max_linear_velocity=1000.0,
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=1.0,
+        ),
+        articulation_props=PhysxArticulationRootPropertiesCfg(
+            enabled_self_collisions=True, solver_position_iteration_count=4, solver_velocity_iteration_count=0
+        ),
+    ),
+)
+
+##
+# Configuration for the Unitree Go2 (simplified) with the back platform payload
+# (Jetson + rail plate + RPLidar + LiDAR + OAK camera) attached to the go2_simplified base link
+##
+
+GO2_SIMPLIFIED_BACK_PLATFORM_CFG = MY_DOG_CFG.replace(
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=GO2_SIMPLIFIED_BACK_PLATFORM_USD_PATH,
         activate_contact_sensors=True,
         rigid_props=PhysxRigidBodyPropertiesCfg(
             disable_gravity=False,

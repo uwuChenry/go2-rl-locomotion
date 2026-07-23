@@ -44,7 +44,7 @@ from .reward_functions import (
 ##
 # Pre-defined configs
 ##
-from .go2_articulation_cfg import GO2_BACK_PLATFORM_CFG
+from .go2_articulation_cfg import GO2_SIMPLIFIED_BACK_PLATFORM_CFG
 
 
 ##
@@ -76,7 +76,7 @@ class Go2SceneCfg(InteractiveSceneCfg):
         debug_vis=False,
     )
     # robot
-    robot: ArticulationCfg = GO2_BACK_PLATFORM_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = GO2_SIMPLIFIED_BACK_PLATFORM_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # height_scanner = RayCasterCfg(
     #     prim_path="{ENV_REGEX_NS}/Robot/base",
