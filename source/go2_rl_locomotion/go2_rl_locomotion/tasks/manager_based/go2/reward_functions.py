@@ -417,6 +417,27 @@ def feet_air_time_tent(env, sensor_cfg: SceneEntityCfg, threshold: float) -> tor
     return torch.sum(reward, dim=1)
 
 
+def feet_air_time_tent_squared(env, sensor_cfg: SceneEntityCfg, threshold: float) -> torch.Tensor:
+    """Squared version of :func:`feet_air_time_tent`.
+
+    Identical in shape and sign -- 0 at exactly `threshold`, negative and unbounded on
+    both sides -- but the penalty grows with the *square* of the error instead of its
+    absolute value. The gradient is therefore proportional to the error rather than
+    constant: near-target swings are barely penalized, while far-off swings are punished
+    much harder (at 0.1 s of error the penalty is 10x smaller than the linear version,
+    at 1.0 s it is 10x larger).
+
+    Note the weight needs rescaling when switching over, since the error is squared: with
+    threshold=0.2 the linear form pays about -0.2 for a dropped swing, the squared form
+    about -0.04.
+    """
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt).torch[:, sensor_cfg.body_ids]
+    last_air_time = contact_sensor.data.last_air_time.torch[:, sensor_cfg.body_ids]
+    reward = -torch.square(last_air_time - threshold) * first_contact
+    return torch.sum(reward, dim=1)
+
+
 class FootClearanceQualityReward(ManagerTermBase):
     """Reward a foot once per landing for the peak height it reached during its swing.
 

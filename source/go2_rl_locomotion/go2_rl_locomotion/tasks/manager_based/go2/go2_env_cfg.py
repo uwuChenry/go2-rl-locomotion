@@ -32,6 +32,7 @@ from .reward_functions import (
     FootStepQualityReward,
     feet_air_time_reward,
     feet_air_time_tent,
+    feet_air_time_tent_squared,
     feet_air_time_uncapped,
     foot_clearance_reward,
     foot_spread_reward,
@@ -44,7 +45,7 @@ from .reward_functions import (
 ##
 # Pre-defined configs
 ##
-from .go2_articulation_cfg import GO2_SIMPLIFIED_BACK_PLATFORM_CFG
+from .go2_articulation_cfg import GO2_COMBINED_CFG
 
 
 ##
@@ -76,7 +77,7 @@ class Go2SceneCfg(InteractiveSceneCfg):
         debug_vis=False,
     )
     # robot
-    robot: ArticulationCfg = GO2_SIMPLIFIED_BACK_PLATFORM_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = GO2_COMBINED_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # height_scanner = RayCasterCfg(
     #     prim_path="{ENV_REGEX_NS}/Robot/base",
@@ -139,44 +140,44 @@ class ObservationsCfg:
         """Observations for policy group."""
         base_lin_vel = ObsTerm(
             func=mdp.base_lin_vel,
-            noise=Unoise(n_min=-0.1, n_max=0.1),
-            # noise=NoiseModelWithAdditiveBiasCfg(
-            #     noise_cfg=Unoise(n_min=-0.2, n_max=0.2),
-            #     bias_noise_cfg=Unoise(n_min=-0.075, n_max=0.075),
-            # ),
+            # noise=Unoise(n_min=-0.1, n_max=0.1),
+            noise=NoiseModelWithAdditiveBiasCfg(
+                noise_cfg=Unoise(n_min=-0.1, n_max=0.1),
+                bias_noise_cfg=Unoise(n_min=-0.0375, n_max=0.0375),
+            ),
         )
         base_ang_vel = ObsTerm(
             func=mdp.base_ang_vel,
-            noise=Unoise(n_min=-0.15, n_max=0.15),
-            # noise=NoiseModelWithAdditiveBiasCfg(
-            #     noise_cfg=Unoise(n_min=-0.3, n_max=0.3),
-            #     bias_noise_cfg=Unoise(n_min=-0.05, n_max=0.05),
-            # ),
+            # noise=Unoise(n_min=-0.15, n_max=0.15),
+            noise=NoiseModelWithAdditiveBiasCfg(
+                noise_cfg=Unoise(n_min=-0.15, n_max=0.15),
+                bias_noise_cfg=Unoise(n_min=-0.025, n_max=0.025),
+            ),
         )
         projected_gravity = ObsTerm(
             func=mdp.projected_gravity,
-            noise=Unoise(n_min=-0.04, n_max=0.04),
-            # noise=NoiseModelWithAdditiveBiasCfg(
-            #     noise_cfg=Unoise(n_min=-0.08, n_max=0.08),
-            #     bias_noise_cfg=Unoise(n_min=-0.025, n_max=0.025),
-            # ),
+            # noise=Unoise(n_min=-0.04, n_max=0.04),
+            noise=NoiseModelWithAdditiveBiasCfg(
+                noise_cfg=Unoise(n_min=-0.04, n_max=0.04),
+                bias_noise_cfg=Unoise(n_min=-0.0125, n_max=0.0125),
+            ),
         )
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         joint_pos = ObsTerm(
             func=mdp.joint_pos_rel,
-            noise=Unoise(n_min=-0.01, n_max=0.01),
-            # noise=NoiseModelWithAdditiveBiasCfg(
-            #     noise_cfg=Unoise(n_min=-0.02, n_max=0.02),
-            #     bias_noise_cfg=Unoise(n_min=-0.005, n_max=0.005),
-            # ),
+            # noise=Unoise(n_min=-0.01, n_max=0.01),
+            noise=NoiseModelWithAdditiveBiasCfg(
+                noise_cfg=Unoise(n_min=-0.01, n_max=0.01),
+                bias_noise_cfg=Unoise(n_min=-0.0025, n_max=0.0025),
+            ),
         )
         joint_vel = ObsTerm(
             func=mdp.joint_vel_rel,
-            noise=Unoise(n_min=-1.25, n_max=1.25),
-            # noise=NoiseModelWithAdditiveBiasCfg(
-            #     noise_cfg=Unoise(n_min=-2.5, n_max=2.5),
-            #     bias_noise_cfg=Unoise(n_min=-0.125, n_max=0.125),
-            # ),
+            # noise=Unoise(n_min=-1.25, n_max=1.25),
+            noise=NoiseModelWithAdditiveBiasCfg(
+                noise_cfg=Unoise(n_min=-1.25, n_max=1.25),
+                bias_noise_cfg=Unoise(n_min=-0.0625, n_max=0.0625),
+            ),
         )
         actions = ObsTerm(func=mdp.last_action)
 
@@ -198,8 +199,8 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.8, 0.8), # 0.8 .0.8
-            "dynamic_friction_range": (0.6, 0.6), #0.6 0.6
+            "static_friction_range": (0.7, 0.9), # 0.8 .0.8
+            "dynamic_friction_range": (0.5, 0.7), #0.6 0.6
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
@@ -265,7 +266,7 @@ class EventCfg:
         func=mdp.push_by_setting_velocity,
         mode="interval",
         interval_range_s=(10.0, 15.0),
-        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
+        params={"velocity_range": {"x": (-0.8, 0.8), "y": (-0.8, 0.8)}},
     )
 
 
@@ -305,9 +306,18 @@ class RewardsCfg:
         weight=20.0, #0.125
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
-            "threshold": 0.2, 
+            "threshold": 0.2,
         },
     )
+
+    # feet_air_time2 = RewTerm(
+    #     func=feet_air_time_tent_squared,
+    #     weight=20.0, #0.125
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+    #         "threshold": 0.23,
+    #     },
+    # )
 
     foot_clearance_quality = RewTerm(
         func=FootClearanceQualityReward,
@@ -335,7 +345,7 @@ class RewardsCfg:
     # Height-based reward 
     height_scan_threshold = RewTerm(
         func=reward_base_height_above_threshold,
-        weight=0.1,
+        weight=0.2,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "min_height": 0.2,  # 0.0 reward at 23cm
@@ -345,7 +355,7 @@ class RewardsCfg:
 
     foot_clearance = RewTerm(
         func=foot_clearance_reward,
-        weight=0.2, 
+        weight=0.3, 
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
             "target_height": 0.1,  # Target 10cm foot clearance
@@ -387,7 +397,10 @@ class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     base_contact = DoneTerm(
         func=mdp.illegal_contact,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["base", "Head_lower"]),
+            "threshold": 1.0,
+        },
     )
 
 
@@ -464,3 +477,40 @@ class Go2EnvCfg_PLAY(Go2EnvCfg):
         # remove random pushing event
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+
+@configclass
+class Go2EnvCfgHistory(Go2EnvCfg):
+    """Go2 locomotion with a stacked observation history fed to a plain MLP.
+
+    The policy sees the last 10 observations instead of just the current one, which lets it
+    infer things a single frame cannot expose: the base mass/COM it was spawned with, the
+    ground friction, and the true value behind a noisy or biased sensor reading. Those are
+    all randomized per-episode in :class:`EventCfg`, and a memoryless policy has no way to
+    tell which draw it got -- it can only learn one conservative average behaviour.
+
+    This is the cheap version of what the RNN config buys, with a fixed window instead of a
+    learned recurrent state.
+    """
+
+    def __post_init__(self) -> None:
+        # post init of parent
+        super().__post_init__()
+
+        # 10 frames = current + 9 past = 0.18 s of context at the 50 Hz control rate
+        # (decimation 4 x sim.dt 0.005). History stores the *corrupted* observations, so
+        # the policy learns to filter the noise rather than being handed clean values.
+        self.observations.policy.history_length = 10
+        self.observations.policy.flatten_history_dim = True
+
+
+@configclass
+class Go2EnvCfgHistory_PLAY(Go2EnvCfg_PLAY):
+    """Play/test configuration for the observation-history agent."""
+
+    def __post_init__(self) -> None:
+        # post init of parent
+        super().__post_init__()
+
+        self.observations.policy.history_length = 10
+        self.observations.policy.flatten_history_dim = True
